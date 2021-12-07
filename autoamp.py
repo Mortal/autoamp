@@ -2,6 +2,7 @@ import argparse
 import math
 import struct
 import wave
+from typing import List
 
 import numpy as np
 import scipy.signal
@@ -134,6 +135,24 @@ def repsine(a, mult, freq):
     return dbg
 
 
+def sections(bits):
+    bits = np.r_[False, bits, False]
+    starts = bits[1:] & ~bits[:-1]
+    ends = ~bits[1:] & bits[:-1]
+    assert np.sum(starts) == np.sum(ends)
+    return zip(starts.nonzero()[0], ends.nonzero()[0])
+
+
+def amp_and_duck(samples, target):
+    assert samples.dtype == np.float32
+    amp = np.ones(len(samples) + 1, dtype=np.float32) / target
+    above = samples > target
+    amp[:-1][above] = np.minimum(amp[:-1][above], 1 / samples[above])
+    amp[1:][above] = np.minimum(amp[1:][above], 1 / samples[above])
+    assert len(amp) == len(samples) + 1
+    return amp
+
+
 def main() -> None:
     args = parser.parse_args()
     inp = WaveRead(args.input)
@@ -152,30 +171,108 @@ def main() -> None:
             data, samplerate * g, params.framerate * g
         ).astype(np.float32)
     print(data.dtype, data.shape)
-    power = data ** 2
-    power = power.max(axis=1)
-    k = 4
-    r = 3
-    w = 20
-    pad = samplerate // k * w * k
-    power = np.r_[np.zeros(pad // 2, np.float32), power, np.zeros(pad // 2)]
-    power_ds = rolling(power, samplerate // k, samplerate // k).max(axis=1)
-    print(power_ds.shape, power_ds.dtype)
-    power_ds_roll = rolling(power_ds, w * k, r * k)
-    print(power_ds_roll.shape, power_ds_roll.dtype)
-    lows, medians, highs = np.percentile(power_ds_roll, [20, 70, 95], axis=1).astype(
-        np.float32
-    )
-    print(lows.shape, lows.dtype)
-    dbg = np.c_[
-        repsine(lows, r * samplerate, 220 / samplerate),
-        repsine(medians, r * samplerate, 220 / samplerate),
-        repsine(highs, r * samplerate, 220 / samplerate),
-    ]
-    print(dbg.dtype, dbg.shape)
+    power = data.max(axis=1)
+    bucketsize = samplerate // 4
+    power_ds = rolling(power, bucketsize, bucketsize).max(axis=1)
+    vals = np.argsort(power_ds)
+    n = len(power_ds)
+    node = np.zeros((n,), np.int32) - 1
+    tree: List[List[int]] = []
+    root: List[int] = []
+    unions = []
+
+    def find_root(n):
+        assert n >= 0
+        while root[n] != n:
+            root[n] = n = root[root[n]]
+        return n
+
+    for i in vals:
+        assert node[i] == -1
+        left = i > 0 and node[i-1] != -1
+        right = i + 1 < n and node[i+1] != -1
+        if left and right:
+            node[i] = len(tree)
+            root.append(len(tree))
+            left_root = find_root(node[i-1])
+            right_root = find_root(node[i+1])
+            root[left_root] = root[right_root] = len(tree)
+            left_node = tree[left_root]
+            right_node = tree[right_root]
+            unions.append((power_ds[i], left_node[:], right_node[:]))
+            tree.append([left_node[0], len(tree), right_node[2], min((left_node[3], right_node[3]), key=lambda i: power_ds[i])])
+        elif right:
+            node[i] = find_root(node[i+1])
+            assert tree[node[i]][0] == i + 1
+            tree[node[i]][0] = i
+        elif left:
+            node[i] = find_root(node[i-1])
+            assert tree[node[i]][2] == i - 1, (i, node[i], node[i-1], tree[node[i-1]], tree[node[i]])
+            tree[node[i]][2] = i
+        else:
+            node[i] = len(tree)
+            root.append(len(tree))
+            tree.append([i, i, i, i])
+
+    time_threshold = samplerate * 10 / bucketsize
+
+    for p, a, b in unions:
+        a_a = np.inf if a[0] == 0 else a[2] - a[0] + 1
+        b_a = np.inf if b[2] == len(power_ds)-1 else b[2] - b[0] + 1
+        if b_a < time_threshold:
+            assert np.all(power_ds[b[0]:b[2]+1] <= p)
+            power_ds[b[0]:b[2]+1] = p
+        if a_a < time_threshold:
+            assert np.all(power_ds[a[0]:a[2]+1] <= p)
+            power_ds[a[0]:a[2]+1] = p
+        # if a_a > b_a < time_threshold:
+        #     assert np.all(power_ds[b[0]:b[2]+1] < p)
+        #     power_ds[b[0]:b[2]+1] = p
+        # elif b_a > a_a < time_threshold:
+        #     assert np.all(power_ds[a[0]:a[2]+1] < p)
+        #     power_ds[a[0]:a[2]+1] = p
+
+    if 0:
+        diff = power_ds[1:] != power_ds[:-1]
+        i = 0
+        f = bucketsize / samplerate
+        for j in diff.nonzero()[0]:
+            print(f*i, f*(j+1), power_ds[i])
+            i = j+1
+        print(f*i, f*len(power_ds), power_ds[i])
+
+    if 0:
+        for loud_threshold in np.arange(30):
+            loud_threshold = (1 + loud_threshold) * 0.001
+            is_quiet = power_ds < loud_threshold
+            quiet_target = np.percentile(power_ds[is_quiet], 99)
+            print("%.3f" % loud_threshold, quiet_target)
+
+    loud_threshold = 0.011 ** 0.5
+    is_quiet = power_ds < loud_threshold
+    quiet_target = np.median(power_ds[is_quiet])
+    print("%.4f" % loud_threshold, quiet_target)
+    for i, j in sections(is_quiet & (power_ds > quiet_target)):
+        if i == 0 or not is_quiet[i-1] or j == len(is_quiet) or not is_quiet[j]:
+            is_quiet[i:j] = False
+    # dbg = np.sin(np.arange(len(power)) * (2 * np.pi * 220 / samplerate), dtype=np.float32)
+    # for i, j in sections(~is_quiet):
+    #     dbg[i * bucketsize : j * bucketsize] = 0
+    output = np.array(data)
+    print(output.dtype, output.shape)
+    for i, j in sections(is_quiet):
+        assert len(power_ds[i:j]) == j - i
+        assert len(np.arange(j - i + 1)) == j - i + 1
+        amt = np.interp(
+            np.arange((j - i) * bucketsize),
+            np.arange(j - i + 1) * bucketsize,
+            amp_and_duck(power_ds[i:j], quiet_target),
+        )
+        # dbg[i * bucketsize : j * bucketsize] /= amt
+        output[i * bucketsize : j * bucketsize] *= np.c_[amt]
     out = WaveWrite(args.output)
-    out.setparams(params._replace(nchannels=dbg.shape[1], framerate=samplerate))
-    out.writeframes(dbg.reshape(-1).tobytes())
+    out.setparams(params._replace(nchannels=output.shape[1], framerate=samplerate))
+    out.writeframes(output.reshape(-1).tobytes())
     out.close()
 
 
